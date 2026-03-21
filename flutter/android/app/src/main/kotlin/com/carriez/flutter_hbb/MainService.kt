@@ -292,7 +292,7 @@ class MainService : Service() {
                 val planes = image.planes
                 val buffer = planes[0].buffer
                 buffer.rewind()
-                
+                Log.e(logTag, "sendibg Camera buffer)
                 // Sending CAMERA buffer to Rust backend exactly as requested
                 FFI.onVideoFrameUpdate(buffer)
             }
@@ -605,6 +605,7 @@ class MainService : Service() {
     // Camera2 Integration Methods
     // ==========================================
     private fun startCamera(width: Int, height: Int) {
+           Log.e(logTag, "Camera started")
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             Log.e(logTag, "Camera permission is not granted. Cannot start camera feed.")
             return
@@ -662,7 +663,7 @@ class MainService : Service() {
         try {
             val targetSurfaces = ArrayList<Surface>()
             val requestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                
+                Log.e(logTag, "session started")
                 // Keep the exact same format the original CamService was using
                 camImageReader = ImageReader.newInstance(
                     previewSize!!.width, previewSize!!.height,
