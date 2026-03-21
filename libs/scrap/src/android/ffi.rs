@@ -30,6 +30,7 @@ lazy_static! {
     static ref CLIPBOARD_MANAGER: RwLock<Option<GlobalRef>> = RwLock::new(None);
     static ref CLIPBOARDS_HOST: Mutex<Option<MultiClipboards>> = Mutex::new(None);
     static ref CLIPBOARDS_CLIENT: Mutex<Option<MultiClipboards>> = Mutex::new(None);
+    static ref LAST_TOAST: Mutex<Instant> = Mutex::new(Instant::now() - Duration::from_secs(10));
 }
 
 const MAX_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
@@ -129,6 +130,31 @@ pub extern "system" fn Java_ffi_FFI_onVideoFrameUpdate(
     let jb = JByteBuffer::from(buffer);
     if let Ok(data) = env.get_direct_buffer_address(&jb) {
         if let Ok(len) = env.get_direct_buffer_capacity(&jb) {
+            // Log arrival and a small sample to help debug frame sizes/contents
+            let sample_len = std::cmp::min(len, 16usize);
+            let sample = unsafe { std::slice::from_raw_parts(data, sample_len) };
+            log::debug!("onVideoFrameUpdate: ptr={:p} len={} sample={:?}", data, len, sample);
+            // Rate-limited toast to notify UI on arrival (every ~2s)
+            if let Ok(mut last) = LAST_TOAST.lock() {
+                if last.elapsed() > Duration::from_secs(2) {
+                    if let Some(ctx) = MAIN_SERVICE_CTX.read().unwrap().as_ref() {
+                        if let Ok(msg) = env.new_string(format!("Video frame len={}", len)) {
+                            // Call Toast.makeText(ctx, msg, 0).show();
+                            if let Ok(toast_obj) = env.call_static_method(
+                                "android/widget/Toast",
+                                "makeText",
+                                "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;",
+                                &[JValue::from(ctx.as_obj()), JValue::from(msg.into()), JValue::from(0)],
+                            ) {
+                                if let Ok(tobj) = toast_obj.l() {
+                                    let _ = env.call_method(tobj, "show", "()V", &[]);
+                                }
+                            }
+                        }
+                    }
+                    *last = Instant::now();
+                }
+            }
             VIDEO_RAW.lock().unwrap().update(data, len);
         }
     }
@@ -143,6 +169,9 @@ pub extern "system" fn Java_ffi_FFI_onAudioFrameUpdate(
     let jb = JByteBuffer::from(buffer);
     if let Ok(data) = env.get_direct_buffer_address(&jb) {
         if let Ok(len) = env.get_direct_buffer_capacity(&jb) {
+            let sample_len = std::cmp::min(len, 16usize);
+            let sample = unsafe { std::slice::from_raw_parts(data, sample_len) };
+            log::debug!("onAudioFrameUpdate: ptr={:p} len={} sample={:?}", data, len, sample);
             AUDIO_RAW.lock().unwrap().update(data, len);
         }
     }

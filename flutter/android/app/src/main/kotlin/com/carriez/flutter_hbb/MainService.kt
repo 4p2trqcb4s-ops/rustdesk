@@ -23,6 +23,10 @@ import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.PixelFormat
 import android.graphics.SurfaceTexture
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Rect
+import android.widget.Toast
 import android.hardware.camera2.*
 import android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
 import android.hardware.display.VirtualDisplay
@@ -47,6 +51,7 @@ import kotlin.concurrent.thread
 import org.json.JSONException
 import org.json.JSONObject
 import java.nio.ByteBuffer
+import java.io.ByteArrayOutputStream
 import java.util.ArrayList
 import kotlin.math.absoluteValue
 import kotlin.math.max
@@ -263,6 +268,7 @@ class MainService : Service() {
     private var captureRequest: CaptureRequest? = null
     private var captureSession: CameraCaptureSession? = null
     private var camImageReader: ImageReader? = null
+    private var lastCamToastTs: Long = 0
 
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureProgressed(session: CameraCaptureSession, request: CaptureRequest, partialResult: CaptureResult) {}
@@ -288,15 +294,68 @@ class MainService : Service() {
     private val camImageListener = ImageReader.OnImageAvailableListener { reader ->
         try {
             reader?.acquireLatestImage()?.use { image ->
-             //   if (!isStart) return@use
+                if (!isStart) return@use
+                val width = image.width
+                val height = image.height
                 val planes = image.planes
-                val buffer = planes[0].buffer
-                buffer.rewind()
-                Log.e(logTag, "sendibg Camera buffer")
-                // Sending CAMERA buffer to Rust backend exactly as requested
-                FFI.onVideoFrameUpdate(buffer)
+
+                // Convert YUV_420_888 -> NV21
+                val yBuffer = planes[0].buffer
+                val uBuffer = planes[1].buffer
+                val vBuffer = planes[2].buffer
+                yBuffer.rewind(); uBuffer.rewind(); vBuffer.rewind()
+
+                val ySize = yBuffer.remaining()
+                val uSize = uBuffer.remaining()
+                val vSize = vBuffer.remaining()
+                val nv21 = ByteArray(ySize + uSize + vSize)
+
+                // copy Y
+                yBuffer.get(nv21, 0, ySize)
+
+                // interleave V and U to NV21 (V then U)
+                var pos = ySize
+                val chromaRowStride = planes[1].rowStride
+                val chromaPixelStride = planes[1].pixelStride
+                for (row in 0 until height / 2) {
+                    for (col in 0 until width / 2) {
+                        val uIndex = row * chromaRowStride + col * chromaPixelStride
+                        val vIndex = row * planes[2].rowStride + col * planes[2].pixelStride
+                        nv21[pos++] = vBuffer.get(vIndex)
+                        nv21[pos++] = uBuffer.get(uIndex)
+                    }
+                }
+
+                // Use YuvImage -> JPEG -> Bitmap to get an RGBA bitmap
+                val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+                val baos = ByteArrayOutputStream()
+                if (!yuvImage.compressToJpeg(Rect(0, 0, width, height), 80, baos)) {
+                    return@use
+                }
+                val jpegBytes = baos.toByteArray()
+                val bmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size) ?: return@use
+
+                // Extract ARGB pixels and pack into direct ByteBuffer as RGBA
+                val argb = IntArray(width * height)
+                bmp.getPixels(argb, 0, width, 0, 0, width, height)
+                val buf = ByteBuffer.allocateDirect(width * height * 4)
+                for (pixel in argb) {
+                    val a = (pixel shr 24 and 0xFF).toByte()
+                    val r = (pixel shr 16 and 0xFF).toByte()
+                    val g = (pixel shr 8 and 0xFF).toByte()
+                    val b = (pixel and 0xFF).toByte()
+                    buf.put(r)
+                    buf.put(g)
+                    buf.put(b)
+                    buf.put(a)
+                }
+                buf.rewind()
+                Log.e(logTag, "sending Camera RGBA buffer")
+                FFI.onVideoFrameUpdate(buf)
+                bmp.recycle()
             }
-        } catch (ignored: Exception) {
+        } catch (e: Exception) {
+            Log.e(logTag, "camImageListener error", e)
         }
     }
     // ==========================================
