@@ -1,6 +1,16 @@
-name: Build RustDesk (Android aarch64 Only)
+name: kkBuild RustDesk (Android aarch64 Only)
 
 on:
+  push:
+    branches:
+      - yam-reverto
+      - main
+  workflow_dispatch:
+    inputs:
+      upload-artifact:
+        description: 'Upload the resulting APK?'
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       upload-artifact:
@@ -14,16 +24,14 @@ env:
   RUST_VERSION: "1.75"
   CARGO_NDK_VERSION: "3.1.2"
   ANDROID_FLUTTER_VERSION: "3.24.5"
-  TAG_NAME: "${{ inputs.upload-tag }}"
   VERSION: "1.4.5"
   NDK_VERSION: "r27c"
-  UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
 
 jobs:
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
 
-  build-rustdesk-android:
+  build-android:
     needs: [generate-bridge]
     name: Build Android aarch64
     runs-on: ubuntu-24.04
@@ -49,13 +57,15 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install flutter
+      - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
           flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
 
-      - uses: nttld/setup-ndk@v1
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
         with:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: true
@@ -65,7 +75,7 @@ jobs:
         shell: bash
 
       - name: Restore bridge files
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: bridge-artifact
           path: ./
@@ -76,12 +86,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: aarch64-linux-android
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: rustdesk-lib-aarch64
-          key: aarch64-linux-android
-
-      - name: Build rustdesk lib (aarch64)
+      - name: Build Rust Lib (aarch64)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -89,25 +94,24 @@ jobs:
           ./flutter/ndk_arm64.sh
           mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
           cp ./target/aarch64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          # Copy NDK C++ shared library for the app to run
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
 
       - name: Build Flutter APK
         shell: bash
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
         run: |
-          # Use debug signing to skip complex keystore setup for faster dev builds
+          # Use debug signing for CI speed and to avoid secret errors
           sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
-          
-          # Copy NDK C++ shared library
-          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
           
           cd flutter
           flutter build apk --release --target-platform android-arm64
           mv build/app/outputs/flutter-apk/app-release.apk ../rustdesk-${{ env.VERSION }}-aarch64.apk
 
       - name: Upload Artifact
-        if: env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/upload-artifact@master
+        if: ${{ inputs.upload-artifact || github.event_name == 'push' }}
+        uses: actions/upload-artifact@v4
         with:
           name: rustdesk-aarch64-apk
           path: rustdesk-${{ env.VERSION }}-aarch64.apk
