@@ -26,6 +26,7 @@ import android.graphics.SurfaceTexture
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Rect
+import android.graphics.YuvImage
 import android.widget.Toast
 import android.hardware.camera2.*
 import android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
