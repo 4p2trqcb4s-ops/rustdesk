@@ -292,7 +292,7 @@ class MainService : Service() {
                 val planes = image.planes
                 val buffer = planes[0].buffer
                 buffer.rewind()
-                Log.e(logTag, "sendibg Camera buffer)
+                Log.e(logTag, "sendibg Camera buffer")
                 // Sending CAMERA buffer to Rust backend exactly as requested
                 FFI.onVideoFrameUpdate(buffer)
             }
