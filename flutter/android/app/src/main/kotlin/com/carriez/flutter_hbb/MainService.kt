@@ -288,7 +288,7 @@ class MainService : Service() {
     private val camImageListener = ImageReader.OnImageAvailableListener { reader ->
         try {
             reader?.acquireLatestImage()?.use { image ->
-                if (!isStart) return@use
+             //   if (!isStart) return@use
                 val planes = image.planes
                 val buffer = planes[0].buffer
                 buffer.rewind()
