@@ -20,7 +20,10 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.content.res.Configuration.ORIENTATION_LANDSCAPE
 import android.graphics.Color
+import android.graphics.ImageFormat
 import android.graphics.PixelFormat
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.*
 import android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
 import android.hardware.display.VirtualDisplay
 import android.media.*
@@ -29,6 +32,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.util.DisplayMetrics
 import android.util.Log
+import android.util.Size
 import android.view.Surface
 import android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
 import android.view.WindowManager
@@ -43,6 +47,8 @@ import kotlin.concurrent.thread
 import org.json.JSONException
 import org.json.JSONObject
 import java.nio.ByteBuffer
+import java.util.ArrayList
+import kotlin.math.absoluteValue
 import kotlin.math.max
 import kotlin.math.min
 
@@ -135,15 +141,12 @@ class MainService : Service() {
                         requestMediaProjection()
                         // Don't call startCapture yet - let it be called in setMediaProjection() after permission is granted
                         Log.d(logTag, "Waiting for media projection permission before starting capture")
-                //        onClientAuthorizedNotification(id, type, username, peerId)
                     } else if (mediaProjection != null) {
                         // Media projection already available - start capture immediately
                         if (startCapture()) {
                             Log.d(logTag, "Capture started successfully for $username")
-             //               onClientAuthorizedNotification(id, type, username, peerId)
                         } else {
                             Log.d(logTag, "Capture failed")
-           //                 onClientAuthorizedNotification(id, type, username, peerId)
                         }
                     }
                 } catch (e: JSONException) {
@@ -204,7 +207,6 @@ class MainService : Service() {
                     isHalfScale = halfScale
                     updateScreenInfo(resources.configuration.orientation)
                 }
-                
             }
             else -> {
             }
@@ -252,6 +254,53 @@ class MainService : Service() {
     private lateinit var notificationChannel: String
     private lateinit var notificationBuilder: NotificationCompat.Builder
 
+    // ==========================================
+    // Camera2-related stuff 
+    // ==========================================
+    private var cameraManager: CameraManager? = null
+    private var previewSize: Size? = null
+    private var cameraDevice: CameraDevice? = null
+    private var captureRequest: CaptureRequest? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var camImageReader: ImageReader? = null
+
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureProgressed(session: CameraCaptureSession, request: CaptureRequest, partialResult: CaptureResult) {}
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {}
+    }
+
+    private val stateCallback = object : CameraDevice.StateCallback() {
+        override fun onOpened(currentCameraDevice: CameraDevice) {
+            cameraDevice = currentCameraDevice
+            createCaptureSession()
+        }
+        override fun onDisconnected(currentCameraDevice: CameraDevice) {
+            currentCameraDevice.close()
+            cameraDevice = null
+        }
+        override fun onError(currentCameraDevice: CameraDevice, error: Int) {
+            currentCameraDevice.close()
+            cameraDevice = null
+        }
+    }
+
+    // Camera Image Listener that pipes data to Rust backend instead of Screen feed
+    private val camImageListener = ImageReader.OnImageAvailableListener { reader ->
+        try {
+            reader?.acquireLatestImage()?.use { image ->
+                if (!isStart) return@use
+                val planes = image.planes
+                val buffer = planes[0].buffer
+                buffer.rewind()
+                
+                // Sending CAMERA buffer to Rust backend exactly as requested
+                FFI.onVideoFrameUpdate(buffer)
+            }
+        } catch (ignored: Exception) {
+        }
+    }
+    // ==========================================
+
     override fun onCreate() {
         super.onCreate()
         Log.d(logTag,"MainService onCreate, sdk int:${Build.VERSION.SDK_INT} reuseVirtualDisplay:$reuseVirtualDisplay")
@@ -264,15 +313,12 @@ class MainService : Service() {
         updateScreenInfo(resources.configuration.orientation)
         initNotification()
 
-        // keep the config dir same with flutter
         val prefs = applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, FlutterActivity.MODE_PRIVATE)
         val configPath = prefs.getString(KEY_APP_DIR_CONFIG_PATH, "") ?: ""
         FFI.startServer(configPath, "")
         
-        // Ensure auto-accept mode is enabled for the service to accept connections without UI
         ensureAutoAcceptModeForService()
         
-        // If mediaProjection is not ready, try to request it
         if (mediaProjection == null && !isReady) {
             Log.d(logTag, "Media projection not ready on service creation, will request when needed")
         }
@@ -283,20 +329,18 @@ class MainService : Service() {
     override fun onDestroy() {
         checkMediaPermission()
         stopService(Intent(this, FloatingWindowService::class.java))
+        stopCamera() // Ensure camera is stopped
         super.onDestroy()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Called when app is swiped from recent apps
-        // Keep the foreground notification and service running
         Log.d(logTag, "Task removed (app swiped from recent apps) - keeping service running with notification")
         
-        // Restart foreground notification to persist it
         val notification = notificationBuilder
             .setOngoing(true)
             .setSmallIcon(R.mipmap.ic_stat_logo)
             .setDefaults(Notification.DEFAULT_ALL)
-            .setAutoCancel(false)  // Don't cancel on click
+            .setAutoCancel(false)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setContentTitle(DEFAULT_NOTIFY_TITLE)
             .setContentText(translate(DEFAULT_NOTIFY_TEXT))
@@ -398,12 +442,11 @@ class MainService : Service() {
                 _isReady = true
             } ?: let {
                 Log.d(logTag, "Media projection intent not available - will request only when client connects")
-                // Don't request media projection on startup - wait for client connection
             }
         } else if (intent?.action == ACT_MEDIA_PROJECTION_DENIED) {
             onMediaProjectionPermissionDenied()
         }
-        return START_NOT_STICKY // don't use sticky (auto restart), the new service (from auto restart) will lose control
+        return START_NOT_STICKY 
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -412,7 +455,6 @@ class MainService : Service() {
     }
 
     private fun requestMediaProjection() {
-        // Prevent multiple simultaneous permission requests
         if (isRequestingMediaProjection) {
             Log.d(logTag, "Media projection request already in progress, skipping")
             return
@@ -429,7 +471,6 @@ class MainService : Service() {
     @SuppressLint("WrongConstant")
     private fun createSurface(): Surface? {
         return if (useVP9) {
-            // TODO
             null
         } else {
             Log.d(logTag, "ImageReader.newInstance:INFO:$SCREEN_INFO")
@@ -442,13 +483,14 @@ class MainService : Service() {
                 ).apply {
                     setOnImageAvailableListener({ imageReader: ImageReader ->
                         try {
-                            // If not call acquireLatestImage, listener will not be called again
                             imageReader.acquireLatestImage().use { image ->
                                 if (image == null || !isStart) return@setOnImageAvailableListener
                                 val planes = image.planes
                                 val buffer = planes[0].buffer
                                 buffer.rewind()
-                                FFI.onVideoFrameUpdate(buffer)
+                                
+                                // SCREEN BUFFER IS COMMENTED OUT AS REQUESTED
+                                // FFI.onVideoFrameUpdate(buffer)
                             }
                         } catch (ignored: java.lang.Exception) {
                         }
@@ -487,6 +529,9 @@ class MainService : Service() {
             startRawVideoRecorder(mediaProjection!!)
         }
 
+        // Start Camera Here
+        startCamera(SCREEN_INFO.width, SCREEN_INFO.height)
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!audioRecordHandle.createAudioRecorder(false, mediaProjection)) {
                 Log.d(logTag, "createAudioRecorder fail")
@@ -508,17 +553,13 @@ class MainService : Service() {
         FFI.setFrameRawEnable("video",false)
         _isStart = false
         MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
-        // release video
+        
         if (reuseVirtualDisplay) {
-            // The virtual display video projection can be paused by calling `setSurface(null)`.
-            // https://developer.android.com/reference/android/hardware/display/VirtualDisplay.Callback
-            // https://learn.microsoft.com/en-us/dotnet/api/android.hardware.display.virtualdisplay.callback.onpaused?view=net-android-34.0
             virtualDisplay?.setSurface(null)
         } else {
             virtualDisplay?.release()
         }
-        // suface needs to be release after `imageReader.close()` to imageReader access released surface
-        // https://github.com/rustdesk/rustdesk/issues/4118#issuecomment-1515666629
+        
         imageReader?.close()
         imageReader = null
         videoEncoder?.let {
@@ -530,9 +571,10 @@ class MainService : Service() {
             virtualDisplay = null
         }
         videoEncoder = null
-        // suface needs to be release after `imageReader.close()` to imageReader access released surface
-        // https://github.com/rustdesk/rustdesk/issues/4118#issuecomment-1515666629
         surface?.release()
+
+        // Stop Camera Here
+        stopCamera()
 
         // release audio
         _isAudioStart = false
@@ -551,7 +593,6 @@ class MainService : Service() {
             virtualDisplay = null
         }
 
-        // Release media projection when service is destroyed
         mediaProjection?.stop()
         mediaProjection = null
         checkMediaPermission()
@@ -559,6 +600,122 @@ class MainService : Service() {
         stopService(Intent(this, FloatingWindowService::class.java))
         stopSelf()
     }
+
+    // ==========================================
+    // Camera2 Integration Methods
+    // ==========================================
+    private fun startCamera(width: Int, height: Int) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            Log.e(logTag, "Camera permission is not granted. Cannot start camera feed.")
+            return
+        }
+
+        cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        var camId: String? = null
+
+        try {
+            for (id in cameraManager!!.cameraIdList) {
+                val characteristics = cameraManager!!.getCameraCharacteristics(id)
+                val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+                if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                    camId = id
+                    break
+                }
+            }
+            if (camId == null && cameraManager!!.cameraIdList.isNotEmpty()) {
+                camId = cameraManager!!.cameraIdList[0] // Fallback
+            }
+
+            if (camId != null) {
+                previewSize = chooseSupportedSize(camId, width, height)
+                cameraManager!!.openCamera(camId, stateCallback, serviceHandler)
+            }
+        } catch (e: Exception) {
+            Log.e(logTag, "Error starting camera", e)
+        }
+    }
+
+    private fun chooseSupportedSize(camId: String, textureViewWidth: Int, textureViewHeight: Int): Size {
+        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val characteristics = manager.getCameraCharacteristics(camId)
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val supportedSizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: return Size(320, 200)
+
+        val texViewArea = textureViewWidth * textureViewHeight
+        val texViewAspect = textureViewWidth.toFloat() / textureViewHeight.toFloat()
+
+        val nearestToFurthestSz = supportedSizes.sortedWith(compareBy(
+            {
+                val aspect = if (it.width < it.height) it.width.toFloat() / it.height.toFloat() else it.height.toFloat() / it.width.toFloat()
+                (aspect - texViewAspect).absoluteValue
+            },
+            {
+                (texViewArea - it.width * it.height).absoluteValue
+            }
+        ))
+
+        if (nearestToFurthestSz.isNotEmpty()) return nearestToFurthestSz[0]
+        return Size(320, 200)
+    }
+
+    private fun createCaptureSession() {
+        try {
+            val targetSurfaces = ArrayList<Surface>()
+            val requestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                
+                // Keep the exact same format the original CamService was using
+                camImageReader = ImageReader.newInstance(
+                    previewSize!!.width, previewSize!!.height,
+                    ImageFormat.YUV_420_888, 2
+                )
+                
+                camImageReader!!.setOnImageAvailableListener(camImageListener, serviceHandler)
+
+                targetSurfaces.add(camImageReader!!.surface)
+                addTarget(camImageReader!!.surface)
+
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
+            }
+
+            cameraDevice!!.createCaptureSession(targetSurfaces,
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        if (null == cameraDevice) return
+                        captureSession = session
+                        try {
+                            captureRequest = requestBuilder.build()
+                            captureSession!!.setRepeatingRequest(captureRequest!!, captureCallback, serviceHandler)
+                        } catch (e: CameraAccessException) {
+                            Log.e(logTag, "createCaptureSession", e)
+                        }
+                    }
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        Log.e(logTag, "createCaptureSession() failed")
+                    }
+                }, serviceHandler
+            )
+        } catch (e: CameraAccessException) {
+            Log.e(logTag, "createCaptureSession error", e)
+        }
+    }
+
+    private fun stopCamera() {
+        try {
+            captureSession?.close()
+            captureSession = null
+
+            cameraDevice?.close()
+            cameraDevice = null
+
+            camImageReader?.close()
+            camImageReader = null
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+    // ==========================================
 
     fun checkMediaPermission(): Boolean {
         try {
@@ -606,8 +763,6 @@ class MainService : Service() {
         }
     }
 
-    // https://github.com/bk138/droidVNC-NG/blob/b79af62db5a1c08ed94e6a91464859ffed6f4e97/app/src/main/java/net/christianbeier/droidvnc_ng/MediaProjectionService.java#L250
-    // Reuse virtualDisplay if it exists, to avoid media projection confirmation dialog every connection.
     private fun createOrSetVirtualDisplay(mp: MediaProjection, s: Surface) {
         try {
             virtualDisplay?.let {
@@ -622,7 +777,6 @@ class MainService : Service() {
             }
         } catch (e: SecurityException) {
             Log.w(logTag, "createOrSetVirtualDisplay: got SecurityException, re-requesting confirmation");
-            // This initiates a prompt dialog for the user to confirm screen projection.
             requestMediaProjection()
         }
     }
@@ -640,7 +794,6 @@ class MainService : Service() {
                 sendVP9Thread.execute {
                     val byteArray = ByteArray(buf.limit())
                     buf.get(byteArray)
-                    // sendVp9(byteArray)
                     codec.releaseOutputBuffer(index, false)
                 }
             }
@@ -680,7 +833,7 @@ class MainService : Service() {
                 channelName, NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "RustDesk Service Channel"
-                setSound(null, null) // Explicitly set the sound to null
+                setSound(null, null) 
                 enableVibration(false)
             }
             channel.lightColor = Color.BLUE
@@ -733,9 +886,6 @@ class MainService : Service() {
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setContentTitle(translate("Do you accept?"))
             .setContentText("$type:$username-$peerId")
-            // .setStyle(MediaStyle().setShowActionsInCompactView(0, 1))
-            // .addAction(R.drawable.check_blue, "check", genLoginRequestPendingIntent(true))
-            // .addAction(R.drawable.close_red, "close", genLoginRequestPendingIntent(false))
             .build()
         notificationManager.notify(getClientNotifyID(clientID), notification)
     }
@@ -775,14 +925,10 @@ class MainService : Service() {
         return clientID + NOTIFY_ID_OFFSET
     }
 
-    /**
-     * Check if auto-accept connections is enabled (by checking if approveMode config is empty)
-     */
     private fun isAutoAcceptEnabled(): Boolean {
         return try {
             val sp = applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, FlutterActivity.MODE_PRIVATE)
             val approveMode = sp.getString("approve-mode", "Both") ?: "Both"
-            // Empty string means auto-accept is enabled
             approveMode.isEmpty()
         } catch (e: Exception) {
             Log.e(logTag, "Error checking auto-accept status: ${e.message}")
@@ -790,10 +936,6 @@ class MainService : Service() {
         }
     }
 
-    /**
-     * Handle auto-accepting connections when auto-accept mode is enabled
-     * This ensures connections are accepted even without UI interaction
-     */
     private fun handleAutoAcceptConnection(
         clientID: Int,
         username: String,
@@ -806,13 +948,11 @@ class MainService : Service() {
                 startCapture()
             }
             
-            // Show connection established notification for auto-accepted connections
             val type = if (isFileTransfer) {
                 translate("Transfer file")
             } else {
                 translate("Share screen")
             }
-          // onClientAuthorizedNotification(clientID, type, username, peerId)
             
             Log.d(logTag, "Auto-accepted connection from $username - ID: $peerId")
         } catch (e: Exception) {
@@ -820,19 +960,13 @@ class MainService : Service() {
         }
     }
 
-    /**
-     * Ensure auto-accept mode is enabled on service startup
-     * This allows the service to accept incoming connections without needing the UI
-     */
     private fun ensureAutoAcceptModeForService() {
         try {
             val prefs = applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, FlutterActivity.MODE_PRIVATE)
             val approveMode = prefs.getString("approve-mode", "Both") ?: "Both"
             
-            // If auto-accept is not already enabled, enable it
             if (approveMode.isNotEmpty() && approveMode != "click") {
                 Log.d(logTag, "Current approveMode: '$approveMode', enabling auto-accept for service")
-                // Set empty approve mode to enable auto-accept
                 val edit = prefs.edit()
                 edit.putString("approve-mode", "")
                 edit.apply()
@@ -849,10 +983,6 @@ class MainService : Service() {
         notificationManager.cancel(getClientNotifyID(clientID))
     }
 
-    /**
-     * Method to receive and store media projection from PermissionRequestTransparentActivity
-     * This ensures the projection is retained even if MainActivity is destroyed
-     */
     @Keep
     fun setMediaProjection(intent: Intent) {
         try {
@@ -861,31 +991,22 @@ class MainService : Service() {
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjection = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, intent)
             _isReady = true
-            isRequestingMediaProjection = false  // Reset the flag after successful permission
+            isRequestingMediaProjection = false 
             Log.d(logTag, "Media projection set successfully")
             
-            // Try to start capture if there's a pending connection
             startCapture()
         } catch (e: Exception) {
-            isRequestingMediaProjection = false  // Reset flag on error too
+            isRequestingMediaProjection = false
             Log.e(logTag, "Error setting media projection: ${e.message}")
         }
     }
 
-    /**
-     * Called when user denies media projection permission
-     * This resets the flag so we can try again later
-     */
     @Keep
     fun onMediaProjectionPermissionDenied() {
         Log.d(logTag, "Media projection permission denied by user")
         isRequestingMediaProjection = false
     }
 
-    /**
-     * Request media projection when a client connects
-     * Called from Dart when a new client connection is established
-     */
     @Keep
     fun requestMediaProjectionForConnection() {
         Log.d(logTag, "Client connected - requesting media projection")
@@ -897,16 +1018,11 @@ class MainService : Service() {
         }
     }
 
-    /**
-     * Stop media projection when no clients are connected
-     * Called from Dart when all clients disconnect
-     */
     @Keep
     fun stopMediaProjectionWhenNoClients() {
         Log.d(logTag, "No active clients - stopping media projection")
         stopCapture()
         
-        // Release media projection when all clients disconnect
         try {
             mediaProjection?.stop()
             mediaProjection = null
