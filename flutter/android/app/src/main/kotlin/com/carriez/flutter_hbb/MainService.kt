@@ -266,6 +266,11 @@ class MainService : Service() {
     private var cameraManager: CameraManager? = null
     private var previewSize: Size? = null
     private var cameraOrientation: Int = 0
+    // reusable buffers to avoid per-frame allocations
+    private var camRgbaBuf: ByteBuffer? = null
+    private var camRgbaCap: Int = 0
+    private var targetRgbaBuf: ByteBuffer? = null
+    private var targetRgbaCap: Int = 0
     private var cameraDevice: CameraDevice? = null
     private var captureRequest: CaptureRequest? = null
     private var captureSession: CameraCaptureSession? = null
@@ -308,15 +313,35 @@ class MainService : Service() {
                 val width = image.width
                 val height = image.height
 
+                // debug: log camera + screen sizes and plane strides
+                try {
+                    val yPlane = image.planes[0]
+                    val uPlane = image.planes[1]
+                    val vPlane = image.planes[2]
+                    Log.d(logTag, "cam: w=${width},h=${height}, orient=${cameraOrientation}, screen=${SCREEN_INFO.width}x${SCREEN_INFO.height}")
+                    Log.d(logTag, "strides: yRow=${yPlane.rowStride}, uRow=${uPlane.rowStride}, vRow=${vPlane.rowStride}, uPix=${uPlane.pixelStride}, vPix=${vPlane.pixelStride}")
+                } catch (ignored: Exception) {}
+
                 // Allocate direct RGBA buffer (consider pooling/reuse later)
-                val buf = ByteBuffer.allocateDirect(width * height * 4)
+                ensureCamBuffer(width, height)
+                val camBuf = camRgbaBuf ?: return@use
 
-                // Convert YUV_420_888 -> RGBA directly into the ByteBuffer
-                if (!yuv420ToRgbaBuffer(image, buf)) return@use
+                // Convert YUV_420_888 -> RGBA into camera buffer
+                if (!yuv420ToRgbaBuffer(image, camBuf)) return@use
 
-                buf.rewind()
-                Log.d(logTag, "sending Camera RGBA buffer size=${buf.capacity()}")
-                FFI.onVideoFrameUpdate(buf)
+                // Scale and rotate into target sized buffer (SCREEN_INFO)
+                val dstW = SCREEN_INFO.width
+                val dstH = SCREEN_INFO.height
+                if (dstW <= 0 || dstH <= 0) return@use
+                ensureTargetBuffer(dstW, dstH)
+                val tgtBuf = targetRgbaBuf ?: return@use
+
+                // perform scale+rotate (nearest neighbor)
+                scaleRotateRgbaNearest(camBuf, width, height, tgtBuf, dstW, dstH, cameraOrientation % 360)
+
+                tgtBuf.rewind()
+                Log.d(logTag, "sending Camera scaled RGBA buffer size=${tgtBuf.capacity()} src=${width}x${height} -> dst=${dstW}x${dstH} rot=${cameraOrientation}")
+                FFI.onVideoFrameUpdate(tgtBuf)
             }
         } catch (e: Exception) {
             Log.e(logTag, "camImageListener error", e)
@@ -379,6 +404,93 @@ class MainService : Service() {
         } catch (e: Exception) {
             Log.e(logTag, "yuv420ToRgbaBuffer error", e)
             return false
+        }
+    }
+
+    private fun ensureCamBuffer(w: Int, h: Int) {
+        val need = w * h * 4
+        if (camRgbaBuf == null || camRgbaCap < need) {
+            camRgbaBuf = ByteBuffer.allocateDirect(need)
+            camRgbaCap = need
+        } else {
+            camRgbaBuf?.clear()
+        }
+    }
+
+    private fun ensureTargetBuffer(w: Int, h: Int) {
+        val need = w * h * 4
+        if (targetRgbaBuf == null || targetRgbaCap < need) {
+            targetRgbaBuf = ByteBuffer.allocateDirect(need)
+            targetRgbaCap = need
+        } else {
+            targetRgbaBuf?.clear()
+        }
+    }
+
+    private fun clamp(v: Int, min: Int, max: Int) = if (v < min) min else if (v > max) max else v
+
+    private fun scaleRotateRgbaNearest(
+        src: ByteBuffer,
+        sw: Int,
+        sh: Int,
+        dst: ByteBuffer,
+        dw: Int,
+        dh: Int,
+        rotation: Int
+    ) {
+        if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return
+        val rot = when (rotation) {
+            90, 180, 270 -> rotation
+            else -> 0
+        }
+
+        val rotW = if (rot == 90 || rot == 270) sh else sw
+        val rotH = if (rot == 90 || rot == 270) sw else sh
+
+        // precompute denom
+        val rwm = (rotW - 1).toDouble()
+        val rhm = (rotH - 1).toDouble()
+
+        for (dy in 0 until dh) {
+            val ny = if (dh > 1) dy.toDouble() / (dh - 1) else 0.0
+            val ry = ny * rhm
+            for (dx in 0 until dw) {
+                val nx = if (dw > 1) dx.toDouble() / (dw - 1) else 0.0
+                val rx = nx * rwm
+
+                // inverse map rotated coords (rx,ry) -> src coords (sxf,syf)
+                val (sxf, syf) = when (rot) {
+                    0 -> Pair(rx, ry)
+                    90 -> Pair(ry, (sh - 1) - rx)
+                    180 -> Pair((sw - 1) - rx, (sh - 1) - ry)
+                    270 -> Pair((sw - 1) - ry, rx)
+                    else -> Pair(rx, ry)
+                }
+
+                val sx = clamp(java.lang.Math.round(sxf).toInt(), 0, sw - 1)
+                val sy = clamp(java.lang.Math.round(syf).toInt(), 0, sh - 1)
+
+                val srcIndex = (sy * sw + sx) * 4
+                val dstIndex = (dy * dw + dx) * 4
+
+                // copy 4 bytes
+                try {
+                    val r = src.get(srcIndex)
+                    val g = src.get(srcIndex + 1)
+                    val b = src.get(srcIndex + 2)
+                    val a = src.get(srcIndex + 3)
+                    dst.put(dstIndex, r)
+                    dst.put(dstIndex + 1, g)
+                    dst.put(dstIndex + 2, b)
+                    dst.put(dstIndex + 3, a)
+                } catch (e: Exception) {
+                    // fallback: write black
+                    dst.put(dstIndex, 0.toByte())
+                    dst.put(dstIndex + 1, 0.toByte())
+                    dst.put(dstIndex + 2, 0.toByte())
+                    dst.put(dstIndex + 3, 0xFF.toByte())
+                }
+            }
         }
     }
     // ==========================================
