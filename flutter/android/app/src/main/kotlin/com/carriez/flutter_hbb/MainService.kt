@@ -265,6 +265,7 @@ class MainService : Service() {
     // ==========================================
     private var cameraManager: CameraManager? = null
     private var previewSize: Size? = null
+    private var cameraOrientation: Int = 0
     private var cameraDevice: CameraDevice? = null
     private var captureRequest: CaptureRequest? = null
     private var captureSession: CameraCaptureSession? = null
@@ -327,104 +328,59 @@ class MainService : Service() {
      * Returns true on success.
      */
     private fun yuv420ToRgbaBuffer(image: android.media.Image, outBuf: ByteBuffer): Boolean {
-    try {
-        val width = image.width
-        val height = image.height
-        val planes = image.planes
-        
-        val yPlane = planes[0]
-        val uPlane = planes[1]
-        val vPlane = planes[2]
-        
-        val yBuffer = yPlane.buffer
-        val uBuffer = uPlane.buffer
-        val vBuffer = vPlane.buffer
-        
-        val yRowStride = yPlane.rowStride
-        val yPixelStride = yPlane.pixelStride
-        val uRowStride = uPlane.rowStride
-        val vRowStride = vPlane.rowStride
-        val uPixelStride = uPlane.pixelStride
-        val vPixelStride = vPlane.pixelStride
-        
-        outBuf.clear()
-        
-        // Pre-calculate UV values for each 2x2 block
-        val uvWidth = width / 2
-        val uvHeight = height / 2
-        
-        for (row in 0 until uvHeight) {
-            val yRow0 = row * 2
-            val yRow1 = yRow0 + 1
-            
-            // Position UV buffers for this row
-            uBuffer.position(row * uRowStride)
-            vBuffer.position(row * vRowStride)
-            
-            for (col in 0 until uvWidth) {
-                // Get U and V for this 2x2 block
-                val u = (uBuffer.get().toInt() and 0xFF)
-                val v = (vBuffer.get().toInt() and 0xFF)
-                
-                // Skip extra UV pixels if stride > 1
-                if (uPixelStride > 1) uBuffer.position(uBuffer.position() + (uPixelStride - 1))
-                if (vPixelStride > 1) vBuffer.position(vBuffer.position() + (vPixelStride - 1))
-                
-                // Pre-calculate RGB conversion for this UV pair
-                val d = u - 128
-                val e = v - 128
-                
-                // Process 2x2 block (4 pixels)
-                for (dy in 0..1) {
-                    val yRow = if (dy == 0) yRow0 else yRow1
-                    val yOffset = yRow * yRowStride + col * 2 * yPixelStride
-                    
-                    // Pixel 0 (left)
-                    yBuffer.position(yOffset)
-                    val y0 = (yBuffer.get().toInt() and 0xFF)
-                    if (yPixelStride > 1) yBuffer.position(yBuffer.position() + (yPixelStride - 1))
-                    
-                    val c0 = y0 - 16
-                    var r0 = (298 * c0 + 409 * e + 128) shr 8
-                    var g0 = (298 * c0 - 100 * d - 208 * e + 128) shr 8
-                    var b0 = (298 * c0 + 516 * d + 128) shr 8
-                    
-                    r0 = r0.coerceIn(0, 255)
-                    g0 = g0.coerceIn(0, 255)
-                    b0 = b0.coerceIn(0, 255)
-                    
-                    outBuf.put(r0.toByte())
-                    outBuf.put(g0.toByte())
-                    outBuf.put(b0.toByte())
-                    outBuf.put(0xFF.toByte())
-                    
-                    // Pixel 1 (right)
-                    val y1 = (yBuffer.get().toInt() and 0xFF)
-                    if (yPixelStride > 1) yBuffer.position(yBuffer.position() + (yPixelStride - 1))
-                    
-                    val c1 = y1 - 16
-                    var r1 = (298 * c1 + 409 * e + 128) shr 8
-                    var g1 = (298 * c1 - 100 * d - 208 * e + 128) shr 8
-                    var b1 = (298 * c1 + 516 * d + 128) shr 8
-                    
-                    r1 = r1.coerceIn(0, 255)
-                    g1 = g1.coerceIn(0, 255)
-                    b1 = b1.coerceIn(0, 255)
-                    
-                    outBuf.put(r1.toByte())
-                    outBuf.put(g1.toByte())
-                    outBuf.put(b1.toByte())
+        try {
+            val width = image.width
+            val height = image.height
+            val yPlane = image.planes[0]
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+
+            val yBuffer = yPlane.buffer
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+
+            val yRowStride = yPlane.rowStride
+            val uRowStride = uPlane.rowStride
+            val vRowStride = vPlane.rowStride
+            val uPixelStride = uPlane.pixelStride
+            val vPixelStride = vPlane.pixelStride
+
+            // Write RGBA per pixel
+            outBuf.clear()
+            for (row in 0 until height) {
+                val yRowStart = row * yRowStride
+                val uRowStart = (row / 2) * uRowStride
+                val vRowStart = (row / 2) * vRowStride
+                for (col in 0 until width) {
+                    val y = (yBuffer.get(yRowStart + col).toInt() and 0xFF)
+                    val uvCol = (col / 2)
+                    val u = (uBuffer.get(uRowStart + uvCol * uPixelStride).toInt() and 0xFF)
+                    val v = (vBuffer.get(vRowStart + uvCol * vPixelStride).toInt() and 0xFF)
+
+                    val c = y - 16
+                    val d = u - 128
+                    val e = v - 128
+
+                    var r = (298 * c + 409 * e + 128) shr 8
+                    var g = (298 * c - 100 * d - 208 * e + 128) shr 8
+                    var b = (298 * c + 516 * d + 128) shr 8
+
+                    if (r < 0) r = 0 else if (r > 255) r = 255
+                    if (g < 0) g = 0 else if (g > 255) g = 255
+                    if (b < 0) b = 0 else if (b > 255) b = 255
+
+                    outBuf.put(r.toByte())
+                    outBuf.put(g.toByte())
+                    outBuf.put(b.toByte())
                     outBuf.put(0xFF.toByte())
                 }
             }
+            return true
+        } catch (e: Exception) {
+            Log.e(logTag, "yuv420ToRgbaBuffer error", e)
+            return false
         }
-        
-        return true
-    } catch (e: Exception) {
-        Log.e(logTag, "yuv420ToRgbaBuffer error", e)
-        return false
     }
-}
     // ==========================================
 
     override fun onCreate() {
@@ -755,6 +711,12 @@ class MainService : Service() {
 
             if (camId != null) {
                 previewSize = chooseSupportedSize(camId, width, height)
+                try {
+                    val characteristics = cameraManager!!.getCameraCharacteristics(camId)
+                    cameraOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+                } catch (e: Exception) {
+                    cameraOrientation = 0
+                }
                 cameraManager!!.openCamera(camId, stateCallback, serviceHandler)
             }
         } catch (e: Exception) {
