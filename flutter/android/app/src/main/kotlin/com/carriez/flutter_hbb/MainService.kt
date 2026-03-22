@@ -842,10 +842,20 @@ class MainService : Service() {
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val supportedSizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: return Size(320, 200)
 
+        // Cap maximum preview size to 640x480 to reduce bandwidth
+        val maxPreviewWidth = 640
+        val maxPreviewHeight = 480
+        val filteredSizes = supportedSizes.filter { it.width <= maxPreviewWidth && it.height <= maxPreviewHeight }
+        
+        if (filteredSizes.isEmpty()) {
+            // If no size fits constraints, return the smallest available
+            return supportedSizes.minByOrNull { it.width * it.height } ?: Size(320, 200)
+        }
+
         val texViewArea = textureViewWidth * textureViewHeight
         val texViewAspect = textureViewWidth.toFloat() / textureViewHeight.toFloat()
 
-        val nearestToFurthestSz = supportedSizes.sortedWith(compareBy(
+        val nearestToFurthestSz = filteredSizes.sortedWith(compareBy(
             {
                 val aspect = if (it.width < it.height) it.width.toFloat() / it.height.toFloat() else it.height.toFloat() / it.width.toFloat()
                 (aspect - texViewAspect).absoluteValue
