@@ -37,38 +37,6 @@ impl Capturer {
 impl crate::TraitCapturer for Capturer {
     fn frame<'a>(&'a mut self, _timeout: Duration) -> io::Result<Frame<'a>> {
         if get_video_raw(&mut self.rgba, &mut self.saved_raw_data).is_some() {
-            // Detect JPEG-encoded frames (start with 0xFF 0xD8) and decode to RGBA
-            if self.rgba.len() >= 2 && self.rgba[0] == 0xFF && self.rgba[1] == 0xD8 {
-                // decode JPEG to RGB using jpeg-decoder
-                let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&self.rgba));
-                let pixels = match decoder.decode() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::error!("jpeg decode error: {}", e);
-                        return Err(io::Error::new(io::ErrorKind::Other, "jpeg decode failed"));
-                    }
-                };
-                let info = match decoder.info() {
-                    Some(i) => i,
-                    None => return Err(io::Error::new(io::ErrorKind::Other, "jpeg info missing")),
-                };
-                let w = info.width as usize;
-                let h = info.height as usize;
-                // convert RGB -> RGBA
-                let mut rgba = Vec::with_capacity(w * h * 4);
-                for i in 0..(w * h) {
-                    let r = pixels[i * 3];
-                    let g = pixels[i * 3 + 1];
-                    let b = pixels[i * 3 + 2];
-                    rgba.push(r);
-                    rgba.push(g);
-                    rgba.push(b);
-                    rgba.push(0xFF);
-                }
-                self.rgba = rgba;
-                return Ok(Frame::PixelBuffer(PixelBuffer::new(&self.rgba, w, h)));
-            }
-
             Ok(Frame::PixelBuffer(PixelBuffer::new(
                 &self.rgba,
                 self.width(),
