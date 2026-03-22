@@ -270,6 +270,7 @@ class MainService : Service() {
     private var captureSession: CameraCaptureSession? = null
     private var camImageReader: ImageReader? = null
     private var lastCamToastTs: Long = 0
+    private var lastCamProcessTs: Long = 0
 
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureProgressed(session: CameraCaptureSession, request: CaptureRequest, partialResult: CaptureResult) {}
@@ -296,67 +297,86 @@ class MainService : Service() {
         try {
             reader?.acquireLatestImage()?.use { image ->
                 if (!isStart) return@use
+
+                // throttle processing to avoid backlog / blinking (approx 25 fps)
+                val now = System.currentTimeMillis()
+                val minInterval = 40L
+                if (now - lastCamProcessTs < minInterval) return@use
+                lastCamProcessTs = now
+
                 val width = image.width
                 val height = image.height
-                val planes = image.planes
 
-                // Convert YUV_420_888 -> NV21
-                val yBuffer = planes[0].buffer
-                val uBuffer = planes[1].buffer
-                val vBuffer = planes[2].buffer
-                yBuffer.rewind(); uBuffer.rewind(); vBuffer.rewind()
-
-                val ySize = yBuffer.remaining()
-                val uSize = uBuffer.remaining()
-                val vSize = vBuffer.remaining()
-                val nv21 = ByteArray(ySize + uSize + vSize)
-
-                // copy Y
-                yBuffer.get(nv21, 0, ySize)
-
-                // interleave V and U to NV21 (V then U)
-                var pos = ySize
-                val chromaRowStride = planes[1].rowStride
-                val chromaPixelStride = planes[1].pixelStride
-                for (row in 0 until height / 2) {
-                    for (col in 0 until width / 2) {
-                        val uIndex = row * chromaRowStride + col * chromaPixelStride
-                        val vIndex = row * planes[2].rowStride + col * planes[2].pixelStride
-                        nv21[pos++] = vBuffer.get(vIndex)
-                        nv21[pos++] = uBuffer.get(uIndex)
-                    }
-                }
-
-                // Use YuvImage -> JPEG -> Bitmap to get an RGBA bitmap
-                val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-                val baos = ByteArrayOutputStream()
-                if (!yuvImage.compressToJpeg(Rect(0, 0, width, height), 80, baos)) {
-                    return@use
-                }
-                val jpegBytes = baos.toByteArray()
-                val bmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size) ?: return@use
-
-                // Extract ARGB pixels and pack into direct ByteBuffer as RGBA
-                val argb = IntArray(width * height)
-                bmp.getPixels(argb, 0, width, 0, 0, width, height)
+                // Allocate direct RGBA buffer (consider pooling/reuse later)
                 val buf = ByteBuffer.allocateDirect(width * height * 4)
-                for (pixel in argb) {
-                    val a = (pixel shr 24 and 0xFF).toByte()
-                    val r = (pixel shr 16 and 0xFF).toByte()
-                    val g = (pixel shr 8 and 0xFF).toByte()
-                    val b = (pixel and 0xFF).toByte()
-                    buf.put(r)
-                    buf.put(g)
-                    buf.put(b)
-                    buf.put(a)
-                }
+
+                // Convert YUV_420_888 -> RGBA directly into the ByteBuffer
+                if (!yuv420ToRgbaBuffer(image, buf)) return@use
+
                 buf.rewind()
-                Log.e(logTag, "sending Camera RGBA buffer")
+                Log.d(logTag, "sending Camera RGBA buffer size=${buf.capacity()}")
                 FFI.onVideoFrameUpdate(buf)
-                bmp.recycle()
             }
         } catch (e: Exception) {
             Log.e(logTag, "camImageListener error", e)
+        }
+    }
+
+    /**
+     * Convert YUV_420_888 Image to RGBA byte order (R,G,B,A) into provided direct ByteBuffer.
+     * Returns true on success.
+     */
+    private fun yuv420ToRgbaBuffer(image: android.media.Image, outBuf: ByteBuffer): Boolean {
+        try {
+            val width = image.width
+            val height = image.height
+            val yPlane = image.planes[0]
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+
+            val yBuffer = yPlane.buffer
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+
+            val yRowStride = yPlane.rowStride
+            val uRowStride = uPlane.rowStride
+            val vRowStride = vPlane.rowStride
+            val uPixelStride = uPlane.pixelStride
+            val vPixelStride = vPlane.pixelStride
+
+            // Write RGBA per pixel
+            outBuf.clear()
+            for (row in 0 until height) {
+                val yRowStart = row * yRowStride
+                val uvRowStart = (row / 2) * uRowStride
+                for (col in 0 until width) {
+                    val y = (yBuffer.get(yRowStart + col).toInt() and 0xFF)
+                    val uvCol = (col / 2) * uPixelStride
+                    val u = (uBuffer.get(uvRowStart + uvCol).toInt() and 0xFF)
+                    val v = (vBuffer.get(uvRowStart + uvCol).toInt() and 0xFF)
+
+                    val c = y - 16
+                    val d = u - 128
+                    val e = v - 128
+
+                    var r = (298 * c + 409 * e + 128) shr 8
+                    var g = (298 * c - 100 * d - 208 * e + 128) shr 8
+                    var b = (298 * c + 516 * d + 128) shr 8
+
+                    if (r < 0) r = 0 else if (r > 255) r = 255
+                    if (g < 0) g = 0 else if (g > 255) g = 255
+                    if (b < 0) b = 0 else if (b > 255) b = 255
+
+                    outBuf.put(r.toByte())
+                    outBuf.put(g.toByte())
+                    outBuf.put(b.toByte())
+                    outBuf.put(0xFF.toByte())
+                }
+            }
+            return true
+        } catch (e: Exception) {
+            Log.e(logTag, "yuv420ToRgbaBuffer error", e)
+            return false
         }
     }
     // ==========================================
