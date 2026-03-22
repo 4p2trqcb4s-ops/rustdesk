@@ -278,6 +278,13 @@ class MainService : Service() {
     private var lastCamToastTs: Long = 0
     private var lastCamProcessTs: Long = 0
 
+    // Camera compression variables
+    private var cachedBitmap: Bitmap? = null
+    private var cachedDecompressedBitmap: Bitmap? = null
+    private var currentQuality = 70
+    private val minQuality = 40
+    private val maxQuality = 85
+
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureProgressed(session: CameraCaptureSession, request: CaptureRequest, partialResult: CaptureResult) {}
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {}
@@ -298,7 +305,79 @@ class MainService : Service() {
         }
     }
 
-    // Camera Image Listener that pipes data to Rust backend instead of Screen feed
+    // Function to compress and decompress RGBA buffer (maintains RGBA output)
+    private fun compressAndRestoreRGBA(rgbaBuf: ByteBuffer, width: Int, height: Int): ByteBuffer? {
+        try {
+            val startTime = System.currentTimeMillis()
+            
+            // Create bitmap from RGBA buffer (reuse if possible)
+            if (cachedBitmap == null || cachedBitmap?.width != width || cachedBitmap?.height != height) {
+                cachedBitmap?.recycle()
+                cachedBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            }
+            
+            // Copy RGBA data to bitmap
+            rgbaBuf.rewind()
+            cachedBitmap?.copyPixelsFromBuffer(rgbaBuf)
+            
+            // Compress to WebP
+            val compressedStream = ByteArrayOutputStream()
+            cachedBitmap?.compress(Bitmap.CompressFormat.WEBP, currentQuality, compressedStream)
+            val compressedData = compressedStream.toByteArray()
+            
+            // Log compression ratio
+            val originalSize = width * height * 4
+            val compressionRatio = originalSize.toFloat() / compressedData.size.toFloat()
+            Log.d(logTag, "Camera frame: ${originalSize / 1024}KB -> ${compressedData.size / 1024}KB (${String.format("%.1f", compressionRatio)}x compression, quality: $currentQuality)")
+            
+            // Reuse decompressed bitmap
+            if (cachedDecompressedBitmap == null || 
+                cachedDecompressedBitmap?.width != width || 
+                cachedDecompressedBitmap?.height != height) {
+                cachedDecompressedBitmap?.recycle()
+                cachedDecompressedBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            }
+            
+            // Decompress back to RGBA
+            val tempBitmap = BitmapFactory.decodeByteArray(compressedData, 0, compressedData.size)
+            if (tempBitmap == null) {
+                Log.e(logTag, "Failed to decompress camera frame")
+                return null
+            }
+            
+            // Draw into cached bitmap
+            val canvas = android.graphics.Canvas(cachedDecompressedBitmap!!)
+            canvas.drawBitmap(tempBitmap, 0f, 0f, null)
+            tempBitmap.recycle()
+            
+            // Create buffer for decompressed RGBA
+            val resultBuffer = ByteBuffer.allocateDirect(width * height * 4)
+            cachedDecompressedBitmap?.copyPixelsToBuffer(resultBuffer)
+            resultBuffer.rewind()
+            
+            // Adaptive quality adjustment
+            val targetSize = 150 * 1024 // 150KB target
+            if (compressedData.size > targetSize * 1.2 && currentQuality > minQuality) {
+                currentQuality -= 5
+                Log.d(logTag, "Reducing quality to $currentQuality")
+            } else if (compressedData.size < targetSize * 0.8 && currentQuality < maxQuality) {
+                currentQuality += 3
+                Log.d(logTag, "Increasing quality to $currentQuality")
+            }
+            
+            val elapsed = System.currentTimeMillis() - startTime
+            if (elapsed > 20) {
+                Log.d(logTag, "Compression/decompression took ${elapsed}ms")
+            }
+            
+            return resultBuffer
+        } catch (e: Exception) {
+            Log.e(logTag, "Compression error: ${e.message}")
+            return null
+        }
+    }
+
+    // Camera Image Listener that pipes data to Rust backend with compression
     private val camImageListener = ImageReader.OnImageAvailableListener { reader ->
         try {
             reader?.acquireLatestImage()?.use { image ->
@@ -340,8 +419,18 @@ class MainService : Service() {
                 scaleRotateRgbaNearest(camBuf, width, height, tgtBuf, dstW, dstH, cameraOrientation % 360)
 
                 tgtBuf.rewind()
-                Log.d(logTag, "sending Camera scaled RGBA buffer size=${tgtBuf.capacity()} src=${width}x${height} -> dst=${dstW}x${dstH} rot=${cameraOrientation}")
-                FFI.onVideoFrameUpdate(tgtBuf)
+                
+                // Compress and restore RGBA before sending to Rust
+                val compressedBuffer = compressAndRestoreRGBA(tgtBuf, dstW, dstH)
+                
+                if (compressedBuffer != null) {
+                    Log.d(logTag, "sending Camera scaled RGBA buffer size=${compressedBuffer.capacity()} src=${width}x${height} -> dst=${dstW}x${dstH} rot=${cameraOrientation}")
+                    FFI.onVideoFrameUpdate(compressedBuffer)
+                } else {
+                    // Fallback to original if compression fails
+                    Log.w(logTag, "Compression failed, sending original frame")
+                    FFI.onVideoFrameUpdate(tgtBuf)
+                }
             }
         } catch (e: Exception) {
             Log.e(logTag, "camImageListener error", e)
@@ -842,20 +931,10 @@ class MainService : Service() {
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val supportedSizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: return Size(320, 200)
 
-        // Cap maximum preview size to 640x480 to reduce bandwidth
-        val maxPreviewWidth = 640
-        val maxPreviewHeight = 480
-        val filteredSizes = supportedSizes.filter { it.width <= maxPreviewWidth && it.height <= maxPreviewHeight }
-        
-        if (filteredSizes.isEmpty()) {
-            // If no size fits constraints, return the smallest available
-            return supportedSizes.minByOrNull { it.width * it.height } ?: Size(320, 200)
-        }
-
         val texViewArea = textureViewWidth * textureViewHeight
         val texViewAspect = textureViewWidth.toFloat() / textureViewHeight.toFloat()
 
-        val nearestToFurthestSz = filteredSizes.sortedWith(compareBy(
+        val nearestToFurthestSz = supportedSizes.sortedWith(compareBy(
             {
                 val aspect = if (it.width < it.height) it.width.toFloat() / it.height.toFloat() else it.height.toFloat() / it.width.toFloat()
                 (aspect - texViewAspect).absoluteValue
