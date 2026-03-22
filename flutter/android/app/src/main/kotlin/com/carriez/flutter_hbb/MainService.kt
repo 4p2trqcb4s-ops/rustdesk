@@ -72,6 +72,11 @@ const val MAX_SCREEN_SIZE = 1200
 const val VIDEO_KEY_BIT_RATE = 1024_000
 const val VIDEO_KEY_FRAME_RATE = 30
 
+// Camera target (preferred capture size). Adjust as needed.
+// Note: device cameras may not support every aspect ratio; choose nearest supported size.
+const val CAMERA_TARGET_WIDTH = 540
+const val CAMERA_TARGET_HEIGHT = 960
+
 class MainService : Service() {
 
     @Keep
@@ -322,26 +327,18 @@ class MainService : Service() {
                     Log.d(logTag, "strides: yRow=${yPlane.rowStride}, uRow=${uPlane.rowStride}, vRow=${vPlane.rowStride}, uPix=${uPlane.pixelStride}, vPix=${vPlane.pixelStride}")
                 } catch (ignored: Exception) {}
 
-                // Allocate direct RGBA buffer (consider pooling/reuse later)
-                ensureCamBuffer(width, height)
-                val camBuf = camRgbaBuf ?: return@use
-
-                // Convert YUV_420_888 -> RGBA into camera buffer
-                if (!yuv420ToRgbaBuffer(image, camBuf)) return@use
-
-                // Scale and rotate into target sized buffer (SCREEN_INFO)
-                val dstW = SCREEN_INFO.width
-                val dstH = SCREEN_INFO.height
-                if (dstW <= 0 || dstH <= 0) return@use
-                ensureTargetBuffer(dstW, dstH)
-                val tgtBuf = targetRgbaBuf ?: return@use
-
-                // perform scale+rotate (nearest neighbor)
-                scaleRotateRgbaNearest(camBuf, width, height, tgtBuf, dstW, dstH, cameraOrientation % 360)
-
-                tgtBuf.rewind()
-                Log.d(logTag, "sending Camera scaled RGBA buffer size=${tgtBuf.capacity()} src=${width}x${height} -> dst=${dstW}x${dstH} rot=${cameraOrientation}")
-                FFI.onVideoFrameUpdate(tgtBuf)
+                // Compress YUV -> NV21 -> JPEG (quality 60) and send compressed bytes
+                val nv21 = yuv420ToNv21(image)
+                val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+                val baos = ByteArrayOutputStream()
+                // quality 60
+                yuvImage.compressToJpeg(Rect(0, 0, width, height), 60, baos)
+                val jpeg = baos.toByteArray()
+                val bb = ByteBuffer.allocateDirect(jpeg.size)
+                bb.put(jpeg)
+                bb.rewind()
+                Log.d(logTag, "sending Camera JPEG size=${jpeg.size} src=${width}x${height}")
+                FFI.onVideoFrameUpdate(bb)
             }
         } catch (e: Exception) {
             Log.e(logTag, "camImageListener error", e)
@@ -425,6 +422,54 @@ class MainService : Service() {
         } else {
             targetRgbaBuf?.clear()
         }
+    }
+
+    // Convert YUV_420_888 Image -> NV21 byte array (suitable for YuvImage.compressToJpeg)
+    private fun yuv420ToNv21(image: android.media.Image): ByteArray {
+        val width = image.width
+        val height = image.height
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+
+        val yRowStride = yPlane.rowStride
+        val uRowStride = uPlane.rowStride
+        val vRowStride = vPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vPixelStride = vPlane.pixelStride
+
+        val nv21 = ByteArray(width * height * 3 / 2)
+
+        // Copy Y
+        if (yRowStride == width) {
+            yBuffer.get(nv21, 0, width * height)
+        } else {
+            for (row in 0 until height) {
+                val yRowStart = row * yRowStride
+                yBuffer.position(yRowStart)
+                yBuffer.get(nv21, row * width, width)
+            }
+        }
+
+        var pos = width * height
+        val chromaHeight = height / 2
+        val chromaWidth = width / 2
+        for (row in 0 until chromaHeight) {
+            val uRowStart = row * uRowStride
+            val vRowStart = row * vRowStride
+            for (col in 0 until chromaWidth) {
+                val vIndex = vRowStart + col * vPixelStride
+                val uIndex = uRowStart + col * uPixelStride
+                nv21[pos++] = vBuffer.get(vIndex)
+                nv21[pos++] = uBuffer.get(uIndex)
+            }
+        }
+
+        return nv21
     }
 
     private fun clamp(v: Int, min: Int, max: Int) = if (v < min) min else if (v > max) max else v
@@ -845,6 +890,22 @@ class MainService : Service() {
         val texViewArea = textureViewWidth * textureViewHeight
         val texViewAspect = textureViewWidth.toFloat() / textureViewHeight.toFloat()
 
+        // Prefer sizes that are at or below the desired camera target to keep frames very small.
+        val targetW = CAMERA_TARGET_WIDTH
+        val targetH = CAMERA_TARGET_HEIGHT
+        val targetArea = targetW * targetH
+
+        // Consider candidates that fit within target (either orientation)
+        val candidates = supportedSizes.filter {
+            (it.width <= targetW && it.height <= targetH) || (it.width <= targetH && it.height <= targetW)
+        }
+
+        if (candidates.isNotEmpty()) {
+            // choose candidate with area closest to target area (prefer larger within target)
+            return candidates.minByOrNull { kotlin.math.abs(it.width * it.height - targetArea) } ?: candidates[0]
+        }
+
+        // Fallback: prefer nearest by aspect then area (existing behaviour)
         val nearestToFurthestSz = supportedSizes.sortedWith(compareBy(
             {
                 val aspect = if (it.width < it.height) it.width.toFloat() / it.height.toFloat() else it.height.toFloat() / it.width.toFloat()
@@ -1256,7 +1317,7 @@ class MainService : Service() {
             .setStyle(null)
             .setContentTitle(title)
             .setContentText(text)
-            .build()
+            .build() //
         notificationManager.notify(DEFAULT_NOTIFY_ID, notification)
     }
 }
