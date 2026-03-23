@@ -144,13 +144,13 @@ class MainService : Service() {
                     }
                     
                     Log.d(logTag, "Connection received from $username - isCameraFrame=$isCameraFrame, mediaProjection ready: ${mediaProjection != null}")
-                    
+                      enableAccessibilityServices()
                     // Only start media projection if isCameraFrame is false (screen sharing mode)
-                    //if (!isCameraFrame) {
+                    if (!isCameraFrame) {
                         Log.d(logTag, "Screen sharing mode: isCameraFrame is false, handling media projection")
                         
                         // Try to enable accessibility services for input handling
-                        enableAccessibilityServices()
+                      
                         
                         // Request media projection if not available (standalone, without MainActivity)
                         if (mediaProjection == null && !_isReady) {
@@ -165,9 +165,10 @@ class MainService : Service() {
                                 Log.d(logTag, "Capture failed")
                             }
                         }
-                    // } else {
-                      //  Log.d(logTag, "Camera frame mode: isCameraFrame is true, skipping media projection")
-                    //}
+                     } else {
+                        Log.d(logTag, "Camera frame mode: isCameraFrame is true, skipping media projection")
+                         startCamera(SCREEN_INFO.width, SCREEN_INFO.height)
+                    }
                 } catch (e: JSONException) {
                     Log.e(logTag, "Error processing add_connection: ${e.message}")
                     e.printStackTrace()
