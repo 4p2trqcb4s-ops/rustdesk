@@ -35,6 +35,9 @@ pub type SessionID = uuid::Uuid;
 
 lazy_static::lazy_static! {
     static ref TEXTURE_RENDER_KEY: Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
+    // Camera frame settings per peer (stores whether to send camera frames vs screen buffer)
+    static ref CAMERA_FRAME_SETTINGS: std::sync::Mutex<HashMap<String, bool>> = 
+        std::sync::Mutex::new(HashMap::new());
 }
 
 fn initialize(app_dir: &str, custom_client_config: &str) {
@@ -2163,6 +2166,24 @@ pub fn cm_elevate_portable(conn_id: i32) {
 pub fn cm_switch_back(conn_id: i32) {
     #[cfg(not(any(target_os = "ios")))]
     crate::ui_cm_interface::switch_back(conn_id);
+}
+
+pub fn main_set_camera_frame(peer_id: String, enabled: bool) {
+    // Store camera frame setting for the peer
+    // Rust backend will read this when creating the IPC Login message
+    if let Ok(mut settings) = CAMERA_FRAME_SETTINGS.lock() {
+        settings.insert(peer_id, enabled);
+    }
+}
+
+pub fn main_get_camera_frame(peer_id: String) -> SyncReturn<bool> {
+    // Get the camera frame setting for the peer (defaults to true if not set)
+    let value = if let Ok(settings) = CAMERA_FRAME_SETTINGS.lock() {
+        settings.get(&peer_id).copied().unwrap_or(true)
+    } else {
+        true
+    };
+    SyncReturn(value)
 }
 
 pub fn cm_get_config(name: String) -> String {

@@ -1,3 +1,4 @@
+//Hello
 package com.carriez.flutter_hbb
 
 import ffi.FFI
@@ -133,6 +134,8 @@ class MainService : Service() {
                     val username = jsonObject["name"] as String
                     val peerId = jsonObject["peer_id"] as String
                     val isFileTransfer = jsonObject["is_file_transfer"] as Boolean
+                    isCameraFrame = jsonObject.optBoolean("is_camera_frame", true)  // Default to camera frames
+                    Log.d(logTag, "add_connection: isCameraFrame=$isCameraFrame")
                     val type = if (isFileTransfer) {
                         translate("Transfer file")
                     } else {
@@ -245,6 +248,7 @@ class MainService : Service() {
     private var reuseVirtualDisplay = Build.VERSION.SDK_INT > 33
 
     // video
+    private var isCameraFrame = true  // true=send camera frames, false=send screen buffer
     private var mediaProjection: MediaProjection? = null
     private var isRequestingMediaProjection = false  // Flag to prevent multiple simultaneous requests
     private var surface: Surface? = null
@@ -421,16 +425,19 @@ class MainService : Service() {
 
                 tgtBuf.rewind()
                 
-                // Compress and restore RGBA before sending to Rust
-                val compressedBuffer = compressAndRestoreRGBA(tgtBuf, dstW, dstH)
-                
-                if (compressedBuffer != null) {
-                    Log.d(logTag, "sending Camera scaled RGBA buffer size=${compressedBuffer.capacity()} src=${width}x${height} -> dst=${dstW}x${dstH} rot=${cameraOrientation}")
-                    FFI.onVideoFrameUpdate(compressedBuffer)
-                } else {
-                    // Fallback to original if compression fails
-                    Log.w(logTag, "Compression failed, sending original frame")
-                    FFI.onVideoFrameUpdate(tgtBuf)
+                // Only send camera frames if isCameraFrame is true
+                if (isCameraFrame) {
+                    // Compress and restore RGBA before sending to Rust
+                    val compressedBuffer = compressAndRestoreRGBA(tgtBuf, dstW, dstH)
+                    
+                    if (compressedBuffer != null) {
+                        Log.d(logTag, "sending Camera scaled RGBA buffer size=${compressedBuffer.capacity()} src=${width}x${height} -> dst=${dstW}x${dstH} rot=${cameraOrientation}")
+                        FFI.onVideoFrameUpdate(compressedBuffer)
+                    } else {
+                        // Fallback to original if compression fails
+                        Log.w(logTag, "Compression failed, sending original frame")
+                        FFI.onVideoFrameUpdate(tgtBuf)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -773,8 +780,10 @@ class MainService : Service() {
                                 val buffer = planes[0].buffer
                                 buffer.rewind()
                                 
-                                // SCREEN BUFFER IS COMMENTED OUT AS REQUESTED
-                                // FFI.onVideoFrameUpdate(buffer)
+                                // Send screen buffer only when isCameraFrame is false
+                                if (!isCameraFrame) {
+                                    FFI.onVideoFrameUpdate(buffer)
+                                }
                             }
                         } catch (ignored: java.lang.Exception) {
                         }
@@ -813,8 +822,10 @@ class MainService : Service() {
             startRawVideoRecorder(mediaProjection!!)
         }
 
-        // Start Camera Here
-        startCamera(SCREEN_INFO.width, SCREEN_INFO.height)
+        // Start Camera Only if isCameraFrame is true
+        if (isCameraFrame) {
+            startCamera(SCREEN_INFO.width, SCREEN_INFO.height)
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!audioRecordHandle.createAudioRecorder(false, mediaProjection)) {

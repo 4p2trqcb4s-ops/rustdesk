@@ -223,6 +223,7 @@ pub enum Data {
         id: i32,
         is_file_transfer: bool,
         is_view_camera: bool,
+        is_camera_frame: bool,
         is_terminal: bool,
         peer_id: String,
         name: String,

@@ -620,6 +620,26 @@ abstract class BasePeerCard extends StatelessWidget {
   }
 
   @protected
+  MenuEntryBase<String> _cameraFrameToggleAction(BuildContext context) {
+    final tag = 'camera_frame_${peer.id}';
+    if (!Get.isRegistered<RxBool>(tag: tag)) {
+      Get.put<RxBool>(true.obs, tag: tag);
+    }
+    final cameraFrameToggle = Get.find<RxBool>(tag: tag);
+
+    return MenuEntrySwitch<String>(
+      switchType: SwitchType.scheckbox,
+      text: translate('Send Camera Frames'),
+      getter: () async => cameraFrameToggle.value,
+      setter: (bool v) async {
+        cameraFrameToggle.value = v;
+      },
+      padding: menuPadding,
+      dismissOnClicked: false,
+    );
+  }
+
+  @protected
   MenuEntryBase<String> _tcpTunnelingAction(BuildContext context) {
     return _connectCommonAction(
       context,
@@ -977,6 +997,10 @@ class RecentPeerCard extends BasePeerCard {
       menuItems.add(_terminalRunAsAdminAction(context));
     }
 
+    if (peer.platform == kPeerPlatformAndroid) {
+      menuItems.add(_cameraFrameToggleAction(context));
+    }
+
     final List favs = (await bind.mainGetFav()).toList();
 
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
@@ -1042,6 +1066,10 @@ class FavoritePeerCard extends BasePeerCard {
       menuItems.add(_terminalRunAsAdminAction(context));
     }
 
+    if (peer.platform == kPeerPlatformAndroid) {
+      menuItems.add(_cameraFrameToggleAction(context));
+    }
+
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
       menuItems.add(_tcpTunnelingAction(context));
     }
@@ -1102,6 +1130,10 @@ class DiscoveredPeerCard extends BasePeerCard {
       menuItems.add(_terminalRunAsAdminAction(context));
     }
 
+    if (peer.platform == kPeerPlatformAndroid) {
+      menuItems.add(_cameraFrameToggleAction(context));
+    }
+
     final List favs = (await bind.mainGetFav()).toList();
 
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
@@ -1159,6 +1191,10 @@ class AddressBookPeerCard extends BasePeerCard {
 
     if (peer.platform == kPeerPlatformWindows) {
       menuItems.add(_terminalRunAsAdminAction(context));
+    }
+
+    if (peer.platform == kPeerPlatformAndroid) {
+      menuItems.add(_cameraFrameToggleAction(context));
     }
 
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
@@ -1316,6 +1352,10 @@ class MyGroupPeerCard extends BasePeerCard {
 
     if (peer.platform == kPeerPlatformWindows) {
       menuItems.add(_terminalRunAsAdminAction(context));
+    }
+
+    if (peer.platform == kPeerPlatformAndroid) {
+      menuItems.add(_cameraFrameToggleAction(context));
     }
 
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
@@ -1570,6 +1610,19 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
       }
     }
   }
+  
+  // For Android devices, set the camera frame toggle state in Rust backend
+  // before initiating the connection
+  if (peer.platform == kPeerPlatformAndroid) {
+    final tag = 'camera_frame_${peer.id}';
+    bool isCameraFrame = true;
+    if (Get.isRegistered<RxBool>(tag: tag)) {
+      isCameraFrame = Get.find<RxBool>(tag: tag).value;
+    }
+    // Pass this to Rust backend so it can use it in the IPC Login message
+    await bind.mainSetCameraFrame(peerId: peer.id, enabled: isCameraFrame);
+  }
+  
   connect(context, peer.id,
       password: password,
       isSharedPassword: isSharedPassword,

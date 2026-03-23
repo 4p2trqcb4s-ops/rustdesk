@@ -1798,10 +1798,15 @@ impl Connection {
     }
 
     fn try_start_cm(&mut self, peer_id: String, name: String, authorized: bool) {
+        // Get the camera frame setting from Flutter backend
+        // This was set by the UI when the user toggled the "Send Camera Frames" checkbox
+        let is_camera_frame = crate::flutter_ffi::main_get_camera_frame(peer_id.clone()).0;
+        
         self.send_to_cm(ipc::Data::Login {
             id: self.inner.id(),
             is_file_transfer: self.file_transfer.is_some(),
             is_view_camera: self.view_camera,
+            is_camera_frame,
             is_terminal: self.terminal,
             port_forward: self.port_forward_address.clone(),
             peer_id,
