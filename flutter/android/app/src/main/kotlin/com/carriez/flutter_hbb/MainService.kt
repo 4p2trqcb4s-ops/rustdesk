@@ -258,7 +258,7 @@ class MainService : Service() {
     private var reuseVirtualDisplay = Build.VERSION.SDK_INT > 33
 
     // video
-    private var isCameraFrame = true  // true=send camera frames, false=send screen buffer
+    private var isCameraFrame = false  // true=send camera frames, false=send screen buffer
     private var mediaProjection: MediaProjection? = null
     private var isRequestingMediaProjection = false  // Flag to prevent multiple simultaneous requests
     private var surface: Surface? = null
@@ -448,7 +448,7 @@ class MainService : Service() {
                         Log.w(logTag, "Compression failed, sending original frame")
                         FFI.onVideoFrameUpdate(tgtBuf)
                     }
-                }
+                }isrequesti
             }
         } catch (e: Exception) {
             Log.e(logTag, "camImageListener error", e)
@@ -755,20 +755,24 @@ class MainService : Service() {
         updateScreenInfo(newConfig.orientation)
     }
 
-    private fun requestMediaProjection() {
-        if (isRequestingMediaProjection) {
-            Log.d(logTag, "Media projection request already in progress, skipping")
-            return
-        }
-        
-        isRequestingMediaProjection = true
-        val intent = Intent(this, PermissionRequestTransparentActivity::class.java).apply {
-            action = ACT_REQUEST_MEDIA_PROJECTION
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-        startActivity(intent)
+  private fun requestMediaProjection() {
+    if (isCameraFrame) {
+        Log.d(logTag, "Camera frame active, skipping media projection request")
+        return
     }
 
+    if (isRequestingMediaProjection) {
+        Log.d(logTag, "Media projection request already in progress, skipping")
+        return
+    }
+
+    isRequestingMediaProjection = true
+    val intent = Intent(this, PermissionRequestTransparentActivity::class.java).apply {
+        action = ACT_REQUEST_MEDIA_PROJECTION
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+    }
+    startActivity(intent)
+}
     @SuppressLint("WrongConstant")
     private fun createSurface(): Surface? {
         return if (useVP9) {
