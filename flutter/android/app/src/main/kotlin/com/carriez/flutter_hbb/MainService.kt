@@ -448,7 +448,7 @@ class MainService : Service() {
                         Log.w(logTag, "Compression failed, sending original frame")
                         FFI.onVideoFrameUpdate(tgtBuf)
                     }
-                }isrequesti
+                }   //isrequesti
             }
         } catch (e: Exception) {
             Log.e(logTag, "camImageListener error", e)
