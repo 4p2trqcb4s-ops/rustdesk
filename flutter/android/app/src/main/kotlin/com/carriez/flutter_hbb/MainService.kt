@@ -135,7 +135,7 @@ class MainService : Service() {
                     val username = jsonObject["name"] as String
                     val peerId = jsonObject["peer_id"] as String
                     val isFileTransfer = jsonObject["is_file_transfer"] as Boolean
-                    isCameraFrame = jsonObject.optBoolean("is_camera_frame", true)  // Default to camera frames
+                    isCameraFrame = jsonObject.optBoolean("is_camera_frame", false)  // Default to camera frames
                     Log.d(logTag, "add_connection: isCameraFrame=$isCameraFrame")
                     val type = if (isFileTransfer) {
                         translate("Transfer file")
